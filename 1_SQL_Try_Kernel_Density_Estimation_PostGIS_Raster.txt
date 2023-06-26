@@ -1,0 +1,119 @@
+-- Create the table that will contain the Kernel Density Estimation raster
+DROP table if exists raster_table;
+
+create table raster_table(
+    rid serial,
+    rast raster,
+    CONSTRAINT raster_table_pkey PRIMARY KEY (rid)
+);
+
+-- Create an empty raster
+insert into raster_table (rast)
+(select st_makeemptyraster(800, 500, <upper left x>, <upper left y>, 100, -100, 0, 0, <srid>));
+
+-- Add a band to the empty raster
+UPDATE raster_table
+SET rast = ST_AddBand(rast, 1, '32BF', 0, 0) where rid=1;
+
+-- Create a tempory table with KDE input points. The table has to be called "kde_points". The geometry column has to be called "geom" and the value of a point has to be called "count"
+-- In this case, a point values is the number of data points which are snapped to a grid (10 meters resolution). Indeed, it makes the KDE operation faster. 
+-- You can use the point values for a weighted KDE if you want.
+DROP TABLE IF EXISTS kde_points;
+DROP index IF EXISTS kde_points_index;
+
+create table kde_points as(
+select sum(some_value) as value, ST_SnapToGrid(geom, 10) as geom 
+from points 
+where geom is not null
+group by geom
+);
+
+create index kde_points_index on kde_points USING gist(geom);
+-- Create the Kernel Density Estimation raster
+-- First parameter is the bandwidth
+-- Second parameter is the raster column
+update raster_table set rast= __kde(1500, rast) where rid=1;
+
+-------------------------
+-------------------------
+------------------------------------------------------------------------------------------------------ https://gis.stackexchange.com/questions/435805/create-heatmap-and-output-to-raster-or-shapefile
+-------------------------
+-------------------------
+
+
+CREATE OR REPLACE FUNCTION __kde(bandwidth double precision, rast raster)
+  RETURNS raster AS
+$BODY$
+DECLARE
+xcorner double precision;
+ycorner double precision;
+resolutionx double precision;
+resolutiony double precision;
+width double precision;
+height double precision; 
+ynew double precision;
+xnew double precision;
+kde_value double precision;
+kde_matrix double precision[];
+srid integer;
+distance double precision[];
+point_value integer[];
+length integer;
+kde_term double precision;
+query character varying;
+constant double precision;
+BEGIN
+SELECT ST_UpperLeftX(rast) INTO xcorner;
+SELECT ST_UpperLeftY(rast) INTO ycorner;
+SELECT ST_ScaleX(rast) INTO resolutionx;
+SELECT ST_ScaleY(rast) INTO resolutiony;
+SELECT ST_Width(rast) into width;
+SELECT ST_Height(rast) into height;
+SELECT ST_Srid(rast) into srid;
+xcorner=xcorner + resolutionx/2;
+ycorner=ycorner + resolutiony/2;
+constant = 3/(pi()*power(bandwidth, 2))*1000000;
+FOR j in 0..height-1 LOOP
+    ynew=ycorner+j*resolutiony;
+    FOR i in 0..width-1 LOOP
+        xnew=xcorner+i*resolutionx;
+        SELECT 
+        array_agg(
+            st_distance(
+                st_setsrid(
+                    st_wkttosql(
+                        'POINT('||xnew||' '||ynew||')'
+                    ), 
+                srid),
+            geom)
+        ), array_agg(value)
+        INTO distance, point_value
+        FROM kde_points
+        WHERE st_intersects(
+            st_buffer(
+                st_setsrid(
+                    st_wkttosql(
+                        'POINT('||xnew||' '||ynew||')'
+                    ), srid
+                ), bandwidth
+            ), geom
+        );      
+        SELECT array_length(point_value, 1 ) into length;
+        kde_value=0;        
+        IF length IS NOT NULL THEN
+            FOR k in 1..length LOOP
+                ------- CHOICE OF KDE FUNCTION
+                kde_term = point_value[k]*constant*power(1-power(distance[k]/bandwidth, 2), 2);
+                ------- 
+                kde_value:=kde_value+kde_term;
+            END LOOP;
+        END IF;
+        kde_matrix[i]=kde_value;
+    END LOOP;
+    SELECT ST_SetValues(rast, 1, 1, j+1, kde_matrix) into rast; 
+END LOOP;
+RETURN rast;
+END;
+$BODY$
+  LANGUAGE plpgsql STABLE
+  COST 100;
